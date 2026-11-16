@@ -1,0 +1,152 @@
+# Ferrum Team Computer — Windows
+#
+# Press "Run workflow" and GitHub boots a fresh Windows PC whose screen
+# you can open from your phone with the free Microsoft Remote Desktop
+# app. No passwords anywhere: the user "ferrum" is created with NO
+# password, and Windows is told to accept that blank password over RDP.
+#
+# The machine lives at most ~6 hours (GitHub's job limit) and its disk
+# is wiped when the run ends. See README.md for the honest details.
+#
+# Note: string literals in this file stick to plain ASCII hyphens on
+# purpose — Windows PowerShell 5.1 (the runner default) can mangle
+# fancy punctuation in output.
+
+name: Team Computer — Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-pc:
+    runs-on: windows-latest
+    # GitHub hard-kills any job at 6 hours; we wind down just before.
+    timeout-minutes: 355
+
+    steps:
+      - name: Create the ferrum user (no password) and turn on Remote Desktop
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Create the ferrum user with NO password. -NoPassword is the
+          # cmdlet's own switch for exactly this: an account with a
+          # blank password. Nothing is set, stored, or printed.
+          if (-not (Get-LocalUser -Name 'ferrum' -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name 'ferrum' -NoPassword -AccountNeverExpires `
+              -Description 'Ferrum team computer user' | Out-Null
+          }
+          Add-LocalGroupMember -Group 'Administrators' -Member 'ferrum' -ErrorAction SilentlyContinue
+
+          # By default Windows refuses NETWORK logons (including RDP)
+          # for accounts with blank passwords - a safety rule called
+          # LimitBlankPasswordUse. Setting it to 0 lifts that block so
+          # ferrum can sign in over Remote Desktop with an empty
+          # password. (The name is Windows' own registry value name.)
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' `
+            -Name 'LimitBlankPasswordUse' -Value 0 -Type DWord
+
+          # Network Level Authentication refuses blank passwords before
+          # the sign-in screen ever appears, so it has to be off for
+          # this passwordless design to work at all.
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 0 -Type DWord
+
+          # Turn Remote Desktop on (0 = allow connections) and make
+          # sure the port is the standard RDP port, 3389.
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'PortNumber' -Value 3389 -Type DWord
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+          Write-Host 'User ferrum is ready (no password) and Remote Desktop is on.'
+
+      - name: Open the tunnel and print the connection address
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # bore is a tiny open-source tunnel (no account, no card):
+          # it gives the RDP port a public bore.pub:PORT address.
+          # Asset name verified against the ekzhang/bore v0.6.0 release
+          # (the zip contains a single bore.exe).
+          $boreDir = Join-Path $env:TEMP 'bore'
+          $zip = Join-Path $env:TEMP 'bore.zip'
+          Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $boreDir -Force
+          $bore = Join-Path $boreDir 'bore.exe'
+
+          # Start the tunnel in the background. bore writes its log
+          # lines to its output streams; capture both so we can find
+          # the address whichever stream it lands on.
+          $outLog = Join-Path $env:TEMP 'bore-out.log'
+          $errLog = Join-Path $env:TEMP 'bore-err.log'
+          Start-Process -FilePath $bore -ArgumentList 'local', '3389', '--to', 'bore.pub' `
+            -RedirectStandardOutput $outLog -RedirectStandardError $errLog `
+            -WindowStyle Hidden
+
+          # bore prints a line like "listening at bore.pub:12345" once
+          # the tunnel is live. Wait for it and pull out just the address.
+          $addr = $null
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 2
+            foreach ($logFile in @($outLog, $errLog)) {
+              if (Test-Path $logFile) {
+                $hit = Select-String -Path $logFile -Pattern 'bore\.pub:\d+' |
+                  Select-Object -First 1
+                if ($hit) { $addr = $hit.Matches[0].Value; break }
+              }
+            }
+            if ($addr) { break }
+          }
+          if (-not $addr) {
+            Write-Host 'bore did not publish an address. Its logs:'
+            if (Test-Path $outLog) { Get-Content $outLog }
+            if (Test-Path $errLog) { Get-Content $errLog }
+            throw 'No bore.pub address was published - see the logs above.'
+          }
+
+          # Remember the address so later steps (the heartbeat) can
+          # re-print it where it is easy to find.
+          "BORE_ADDR=$addr" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # The banner. Only the address is printed - there is no
+          # password to print, because there is not one.
+          $banner = @(
+            '============================================================'
+            '  FERRUM TEAM COMPUTER - WINDOWS IS UP'
+            ''
+            '  Open the Microsoft Remote Desktop app on your phone'
+            '  (free) and add a PC with this address:'
+            ''
+            "      $addr"
+            ''
+            '  User name: ferrum'
+            '  Password: leave it EMPTY - there is no password.'
+            ''
+            '  This machine lives about 5 3/4 hours, then it is gone'
+            '  and its disk is wiped. Save anything you want to keep'
+            '  into the repo or download it before time runs out.'
+            '============================================================'
+          )
+          $banner | ForEach-Object { Write-Host $_ }
+          # Also put the banner on the run's summary page, so the
+          # address is one tap away from the Actions tab on a phone.
+          $banner | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Keep the machine alive
+        shell: powershell
+        run: |
+          # Heartbeat every 30 minutes so the log shows the machine is
+          # alive and how long it has left. 345 minutes of heartbeat
+          # plus setup time stays under GitHub's 6-hour job limit.
+          $total = 345
+          $elapsed = 0
+          while ($elapsed -lt $total) {
+            $remain = $total - $elapsed
+            Write-Host "Team Computer (Windows) still up - about $remain minutes left. Connect at: $env:BORE_ADDR"
+            Start-Sleep -Seconds 1800
+            $elapsed += 30
+          }
+          Write-Host 'Time is up - the Windows team computer is shutting down and its disk is being wiped.'

@@ -1,0 +1,150 @@
+# Ferrum Team Computer — Linux
+#
+# Press "Run workflow" and GitHub boots a fresh Linux PC with a desktop
+# screen you can watch and drive from your phone. No passwords anywhere:
+# the desktop logs itself in as the user "ferrum", and the screen is
+# served with VNC with no password on it.
+#
+# The machine lives at most ~6 hours (GitHub's job limit) and its disk
+# is wiped when the run ends. See README.md for the honest details.
+
+name: Team Computer — Linux
+
+on:
+  workflow_dispatch:
+
+jobs:
+  linux-pc:
+    runs-on: ubuntu-latest
+    # GitHub hard-kills any job at 6 hours; we wind down just before.
+    timeout-minutes: 355
+
+    steps:
+      - name: Install the desktop and the screen server
+        env:
+          # Keeps apt from stopping to ask questions (there is nobody
+          # at a keyboard to answer them).
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          # xfce4      = the desktop itself (light, works well streamed)
+          # lightdm    = the login manager; we configure it below to
+          #              log "ferrum" in automatically
+          # xvfb       = a virtual screen — the runner has no real monitor,
+          #              so the desktop lives on this pretend one (:0)
+          # x11vnc     = serves that live desktop screen over VNC
+          sudo apt-get install -y xfce4 xfce4-goodies lightdm xvfb x11vnc dbus-x11
+
+      - name: Create the ferrum user and set up auto-login
+        run: |
+          # No password is set for ferrum — not here, not anywhere.
+          # useradd without a password flag leaves the account's password
+          # field locked ('!' in /etc/shadow), which is exactly what we
+          # want: the desktop logs in automatically, no password exists.
+          if ! id ferrum >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash ferrum
+          fi
+          # ferrum has no password to type at a sudo prompt, so sudo has
+          # to let him through without one.
+          echo 'ferrum ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/ferrum >/dev/null
+          # LightDM auto-login: on a machine with a real screen, LightDM
+          # reads this and signs ferrum straight into the XFCE desktop.
+          sudo mkdir -p /etc/lightdm/lightdm.conf.d
+          printf '[Seat:*]\nautologin-user=ferrum\nautologin-user-timeout=0\nuser-session=xfce\n' \
+            | sudo tee /etc/lightdm/lightdm.conf.d/50-ferrum-autologin.conf >/dev/null
+          cat /etc/lightdm/lightdm.conf.d/50-ferrum-autologin.conf
+
+      - name: Start the desktop session and serve its screen
+        run: |
+          # Bring up the virtual screen on display :0.
+          # -ac turns off X access control so the ferrum session (a
+          # different user than the one starting X) can use the screen.
+          # This machine is a throwaway with no password on its VNC door
+          # anyway; see the trade-off note in README.md.
+          nohup Xvfb :0 -ac -screen 0 1280x800x24 >/tmp/xvfb.log 2>&1 &
+          sleep 3
+          # Start ferrum's XFCE desktop on that screen, already logged in.
+          nohup sudo -u ferrum env DISPLAY=:0 HOME=/home/ferrum \
+            dbus-launch --exit-with-session startxfce4 >/tmp/xfce-session.log 2>&1 &
+          # Wait until the desktop is really up before serving it.
+          for i in $(seq 1 30); do
+            if pgrep -u ferrum -x xfce4-session >/dev/null 2>&1; then
+              echo "Desktop session is up."
+              break
+            fi
+            sleep 2
+          done
+          # Serve the live :0 screen over VNC on port 5900.
+          # -nopw means exactly what it says: no VNC password. Anyone
+          # with the address can look in — the README says so, plainly.
+          x11vnc -display :0 -nopw -forever -shared -rfbport 5900 -bg -o /tmp/x11vnc.log
+          sleep 2
+          if ! ss -ltn | grep -q ':5900'; then
+            echo "x11vnc did not start listening on port 5900. Its log:"
+            cat /tmp/x11vnc.log
+            exit 1
+          fi
+          echo "VNC is listening on port 5900."
+
+      - name: Open the tunnel and print the connection address
+        run: |
+          # bore is a tiny open-source tunnel (no account, no card):
+          # it gives the VNC port a public bore.pub:PORT address.
+          # Asset name verified against the ekzhang/bore v0.6.0 release.
+          curl -fsSL -o /tmp/bore.tar.gz \
+            https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf /tmp/bore.tar.gz -C /tmp
+          chmod +x /tmp/bore
+          nohup /tmp/bore local 5900 --to bore.pub >/tmp/bore.log 2>&1 &
+          # bore prints a line like "listening at bore.pub:12345" once
+          # the tunnel is live. Wait for it and pull out just the address.
+          ADDR=""
+          for i in $(seq 1 30); do
+            ADDR=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -n 1 || true)
+            [ -n "$ADDR" ] && break
+            sleep 2
+          done
+          if [ -z "$ADDR" ]; then
+            echo "bore did not publish an address. Its log:"
+            cat /tmp/bore.log
+            exit 1
+          fi
+          # Remember the address so later steps (the heartbeat) can
+          # re-print it where it's easy to find.
+          echo "BORE_ADDR=$ADDR" >> "$GITHUB_ENV"
+          # The banner. Only the address is printed — there is no
+          # password to print, because there isn't one.
+          {
+            echo "============================================================"
+            echo "  FERRUM TEAM COMPUTER - LINUX IS UP"
+            echo ""
+            echo "  Open a free VNC app on your phone (RealVNC Viewer or bVNC)"
+            echo "  and connect to this address:"
+            echo ""
+            echo "      $ADDR"
+            echo ""
+            echo "  No password - just connect. You will see ferrum's desktop,"
+            echo "  already logged in."
+            echo "  This machine lives about 5 3/4 hours, then it is gone"
+            echo "  and its disk is wiped. Save anything you want to keep"
+            echo "  into the repo or download it before time runs out."
+            echo "============================================================"
+          } | tee /tmp/banner.txt
+          # Also put the banner on the run's summary page, so the
+          # address is one tap away from the Actions tab on a phone.
+          cat /tmp/banner.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the machine alive
+        run: |
+          # Heartbeat every 30 minutes so the log shows the machine is
+          # alive and how long it has left. 345 minutes of heartbeat
+          # plus setup time stays under GitHub's 6-hour job limit.
+          TOTAL=345
+          ELAPSED=0
+          while [ "$ELAPSED" -lt "$TOTAL" ]; do
+            REMAIN=$((TOTAL - ELAPSED))
+            echo "Team Computer (Linux) still up - about ${REMAIN} minutes left. Connect at: ${BORE_ADDR:-see banner above}"
+            sleep 1800
+            ELAPSED=$((ELAPSED + 30))
+          done
+          echo "Time is up - the Linux team computer is shutting down and its disk is being wiped."
