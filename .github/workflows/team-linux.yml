@@ -5,6 +5,13 @@
 # the desktop logs itself in as the user "ferrum", and the screen is
 # served with VNC with no password on it.
 #
+# The screen is served two ways: as a plain VNC address (for a VNC app)
+# and as a web page (noVNC) that opens in any browser — including inside
+# the Foundry app. When the machine comes up it writes its addresses
+# into current-computer.json in this repo, so the Foundry app can always
+# find the current machine on its own. When the machine goes down it
+# checks in one last time and marks itself down.
+#
 # The machine lives at most ~6 hours (GitHub's job limit) and its disk
 # is wiped when the run ends. See README.md for the honest details.
 
@@ -18,6 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     # GitHub hard-kills any job at 6 hours; we wind down just before.
     timeout-minutes: 355
+    # The check-in steps write current-computer.json back into this
+    # repo with the run's own token — that needs write permission.
+    permissions:
+      contents: write
 
     steps:
       - name: Install the desktop and the screen server
@@ -33,7 +44,10 @@ jobs:
           # xvfb       = a virtual screen — the runner has no real monitor,
           #              so the desktop lives on this pretend one (:0)
           # x11vnc     = serves that live desktop screen over VNC
-          sudo apt-get install -y xfce4 xfce4-goodies lightdm xvfb x11vnc dbus-x11
+          # novnc + websockify = serve the same screen as a web page,
+          #              so it opens in a browser (and in the Foundry app)
+          # jq         = builds the check-in file for the app
+          sudo apt-get install -y xfce4 xfce4-goodies lightdm xvfb x11vnc dbus-x11 novnc websockify jq
 
       - name: Create the ferrum user and set up auto-login
         run: |
@@ -85,19 +99,32 @@ jobs:
             exit 1
           fi
           echo "VNC is listening on port 5900."
+          # Serve the same screen as a web page on port 6080 (noVNC),
+          # so it opens in any browser — and inside the Foundry app.
+          nohup websockify --web /usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
+          sleep 2
+          if ! ss -ltn | grep -q ':6080'; then
+            echo "websockify did not start listening on port 6080. Its log:"
+            cat /tmp/novnc.log
+            exit 1
+          fi
+          echo "Web desktop (noVNC) is listening on port 6080."
 
-      - name: Open the tunnel and print the connection address
+      - name: Open the tunnels and print the connection addresses
         run: |
           # bore is a tiny open-source tunnel (no account, no card):
-          # it gives the VNC port a public bore.pub:PORT address.
+          # it gives a local port a public bore.pub:PORT address.
           # Asset name verified against the ekzhang/bore v0.6.0 release.
           curl -fsSL -o /tmp/bore.tar.gz \
             https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
           tar -xzf /tmp/bore.tar.gz -C /tmp
           chmod +x /tmp/bore
+          # Tunnel one: the VNC port, for VNC apps.
           nohup /tmp/bore local 5900 --to bore.pub >/tmp/bore.log 2>&1 &
+          # Tunnel two: the web desktop port, for browsers and the app.
+          nohup /tmp/bore local 6080 --to bore.pub >/tmp/bore-web.log 2>&1 &
           # bore prints a line like "listening at bore.pub:12345" once
-          # the tunnel is live. Wait for it and pull out just the address.
+          # a tunnel is live. Wait for both and pull out the addresses.
           ADDR=""
           for i in $(seq 1 30); do
             ADDR=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -n 1 || true)
@@ -105,21 +132,37 @@ jobs:
             sleep 2
           done
           if [ -z "$ADDR" ]; then
-            echo "bore did not publish an address. Its log:"
+            echo "bore did not publish a VNC address. Its log:"
             cat /tmp/bore.log
             exit 1
           fi
-          # Remember the address so later steps (the heartbeat) can
-          # re-print it where it's easy to find.
+          WEB_ADDR=""
+          for i in $(seq 1 30); do
+            WEB_ADDR=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore-web.log | head -n 1 || true)
+            [ -n "$WEB_ADDR" ] && break
+            sleep 2
+          done
+          if [ -z "$WEB_ADDR" ]; then
+            echo "bore did not publish a web address. Its log:"
+            cat /tmp/bore-web.log
+            exit 1
+          fi
+          # Remember the addresses so later steps (the check-in and the
+          # heartbeat) can use them.
           echo "BORE_ADDR=$ADDR" >> "$GITHUB_ENV"
-          # The banner. Only the address is printed — there is no
+          echo "BORE_WEB_ADDR=$WEB_ADDR" >> "$GITHUB_ENV"
+          # The banner. Only the addresses are printed — there is no
           # password to print, because there isn't one.
           {
             echo "============================================================"
             echo "  FERRUM TEAM COMPUTER - LINUX IS UP"
             echo ""
-            echo "  Open a free VNC app on your phone (RealVNC Viewer or bVNC)"
-            echo "  and connect to this address:"
+            echo "  In a browser (or inside the Foundry app), open:"
+            echo ""
+            echo "      http://$WEB_ADDR/vnc.html"
+            echo ""
+            echo "  Or open a free VNC app on your phone (RealVNC Viewer"
+            echo "  or bVNC) and connect to this address:"
             echo ""
             echo "      $ADDR"
             echo ""
@@ -131,8 +174,42 @@ jobs:
             echo "============================================================"
           } | tee /tmp/banner.txt
           # Also put the banner on the run's summary page, so the
-          # address is one tap away from the Actions tab on a phone.
+          # addresses are one tap away from the Actions tab on a phone.
           cat /tmp/banner.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check in the addresses for the Foundry app
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Write this machine's addresses into current-computer.json in
+          # the repo, where the Foundry app reads them. One fixed place,
+          # always the current machine — no more hunting through logs.
+          STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EXPIRES=$(date -u -d '+355 minutes' +%Y-%m-%dT%H:%M:%SZ)
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n \
+            --arg status "up" \
+            --arg vnc "$BORE_ADDR" \
+            --arg web "http://$BORE_WEB_ADDR/vnc.html?autoconnect=true&resize=scale" \
+            --arg started_at "$STARTED" \
+            --arg expires_at "$EXPIRES" \
+            --arg run_url "$RUN_URL" \
+            '{status: $status, vnc: $vnc, web: $web, started_at: $started_at, expires_at: $expires_at, run_url: $run_url}' \
+            > /tmp/current-computer.json
+          cat /tmp/current-computer.json
+          # Create the file, or update it if a past run left one behind
+          # (the update needs the current file's sha, so fetch it first).
+          API="https://api.github.com/repos/${{ github.repository }}/contents/current-computer.json"
+          SHA=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" | jq -r '.sha // empty' || true)
+          jq -n \
+            --arg message "Team computer check-in: up" \
+            --arg content "$(base64 -w0 /tmp/current-computer.json)" \
+            --arg sha "$SHA" \
+            '{message: $message, content: $content} + (if $sha == "" then {} else {sha: $sha} end)' \
+            > /tmp/checkin-payload.json
+          curl -fsSL -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "$API" -d @/tmp/checkin-payload.json > /dev/null
+          echo "Checked in: the Foundry app can now find this machine."
 
       - name: Keep the machine alive
         run: |
@@ -143,8 +220,34 @@ jobs:
           ELAPSED=0
           while [ "$ELAPSED" -lt "$TOTAL" ]; do
             REMAIN=$((TOTAL - ELAPSED))
-            echo "Team Computer (Linux) still up - about ${REMAIN} minutes left. Connect at: ${BORE_ADDR:-see banner above}"
+            echo "Team Computer (Linux) still up - about ${REMAIN} minutes left. Web: http://${BORE_WEB_ADDR:-?}/vnc.html - VNC: ${BORE_ADDR:-see banner above}"
             sleep 1800
             ELAPSED=$((ELAPSED + 30))
           done
           echo "Time is up - the Linux team computer is shutting down and its disk is being wiped."
+
+      - name: Check in that the computer is down
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Best effort: mark the machine down so the app stops pointing
+          # at a dead address. If the job was hard-killed this may not
+          # run — the app also watches the expiry time in the check-in,
+          # so a stale "up" goes quiet on its own.
+          jq -n \
+            --arg status "down" \
+            --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{status: $status, at: $at}' \
+            > /tmp/current-computer.json
+          API="https://api.github.com/repos/${{ github.repository }}/contents/current-computer.json"
+          SHA=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" | jq -r '.sha // empty' || true)
+          jq -n \
+            --arg message "Team computer check-in: down" \
+            --arg content "$(base64 -w0 /tmp/current-computer.json)" \
+            --arg sha "$SHA" \
+            '{message: $message, content: $content} + (if $sha == "" then {} else {sha: $sha} end)' \
+            > /tmp/checkin-payload.json
+          curl -fsSL -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "$API" -d @/tmp/checkin-payload.json > /dev/null || true
+          echo "Checked in: down."
