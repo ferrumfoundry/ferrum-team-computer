@@ -1,0 +1,8 @@
+{
+  "status": "up",
+  "vnc": "bore.pub:57191",
+  "web": "http://bore.pub:33891/vnc.html?autoconnect=true&resize=scale",
+  "started_at": "2026-11-17T00:50:14Z",
+  "expires_at": "2026-11-17T06:45:14Z",
+  "run_url": "https://github.com/howarthjakob4-prog/ferrum-team-computer/actions/runs/43990533647"
+}
